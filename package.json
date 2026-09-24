@@ -1,0 +1,29 @@
+{
+  "name": "om-pilot-contract",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Learning project: a hash-anchored O&M audit trail with conditional stablecoin payments (testnet only).",
+  "type": "module",
+  "scripts": {
+    "build": "hardhat build",
+    "test": "hardhat test"
+  },
+  "devDependencies": {
+    "hardhat": "^3.17.0",
+    "@nomicfoundation/hardhat-toolbox-viem": "^5.0.7",
+    "@nomicfoundation/hardhat-ignition": "^3.1.8",
+    "@nomicfoundation/hardhat-ignition-viem": "^3.1.6",
+    "@nomicfoundation/hardhat-keystore": "^3.0.12",
+    "@nomicfoundation/hardhat-network-helpers": "^3.0.11",
+    "@nomicfoundation/hardhat-node-test-runner": "^3.0.17",
+    "@nomicfoundation/hardhat-viem": "^3.0.9",
+    "@nomicfoundation/hardhat-viem-assertions": "^3.1.2",
+    "@nomicfoundation/hardhat-verify": "^3.0.21",
+    "@nomicfoundation/ignition-core": "^3.1.8",
+    "@types/node": "^22.8.5",
+    "forge-std": "github:foundry-rs/forge-std#v1.16.2",
+    "solc": "0.8.37",
+    "typescript": "~6.0.3",
+    "viem": "^2.47.6"
+  }
+}
