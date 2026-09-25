@@ -74,6 +74,12 @@ contract OMPilotCreationTest is OMPilotTestBase {
         expectRefusal(t, validPriceList(), abi.encodeWithSelector(OMPilot.SameOwnerAndProvider.selector));
     }
 
+    function test_refuses_empty_tender_hash() public {
+        OMPilot.Terms memory t = validTerms();
+        t.tenderHash = bytes32(0);
+        expectRefusal(t, validPriceList(), abi.encodeWithSelector(OMPilot.EmptyTenderHash.selector));
+    }
+
     function test_refuses_start_date_not_in_future() public {
         OMPilot.Terms memory t = validTerms();
         t.startDate = NOW; // "now" is not in the future

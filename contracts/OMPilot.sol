@@ -6,12 +6,12 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 /// @title OMPilot — an O&M engagement as a smart contract
 /// @notice Learning project. Not audited. Testnet only. Not a security token.
-/// @dev Stage 1: part A — the tender terms, fixed at creation;
-///      part B — the provider's acceptance and the contract's status;
-///      part C — the owner's deposits;
-///      part D — withdrawals and the rolling lock.
-///      Inspections, repairs and payments follow in Stage 2, which also makes
-///      the lock shrink with payments and reset each budget period.
+/// @dev Stage 1 (complete): the tender terms, fixed at creation; the provider's
+///      acceptance and the contract's status; deposits; withdrawals and the lock.
+///      Stage 2, part 1: the passport — one numbered logbook of fingerprinted
+///      entries — and unpaid records.
+///      Still to come in Stage 2: the inspection schedule, review and payment,
+///      misses, repair claims, and end of term (which completes the lock).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -50,6 +50,37 @@ contract OMPilot {
         NeverActivated // start date reached without acceptance
     }
 
+    /// The kinds of entry in the passport (the numbered logbook).
+    /// Only Acceptance and UnpaidRecord are written so far; the others follow in Stage 2.
+    enum EntryKind {
+        Acceptance, // entry 1: the provider accepts; fingerprint = tender award
+        InspectionSubmission,
+        ClaimSubmission,
+        RejectionNote,
+        UnpaidRecord
+    }
+
+    /// Types of unpaid record (§8.7).
+    enum RecordType {
+        PerformanceCheck,
+        MaintenanceNote,
+        IncidentReport,
+        SiteVisit,
+        Other
+    }
+
+    /// One passport entry. `relatesTo` and `detail` depend on the kind: e.g. for an
+    /// unpaid record, `detail` is its RecordType; later, for an inspection submission,
+    /// `relatesTo` is the inspection number and `detail` its finding.
+    struct Entry {
+        EntryKind kind;
+        address author;
+        uint256 timestamp; // from the block, never typed in
+        bytes32 fingerprint; // SHA-256 of the document
+        uint256 relatesTo;
+        uint8 detail;
+    }
+
     // ------------------------------------------------------------------
     // Public announcements (events) — readable on the block explorer
     // ------------------------------------------------------------------
@@ -62,6 +93,9 @@ contract OMPilot {
 
     /// The owner withdrew `amount`; `newBalance` is what the contract holds afterwards.
     event Withdrawn(address indexed owner, uint256 amount, uint256 newBalance);
+
+    /// A new passport entry was written.
+    event EntryAdded(uint256 indexed number, EntryKind kind, address indexed author, bytes32 fingerprint);
 
     // ------------------------------------------------------------------
     // Named refusals (decision 56)
@@ -84,6 +118,11 @@ contract OMPilot {
     error ZeroAmount();
     error ContractNeverActivated();
     error WithdrawalExceedsUnlocked(uint256 requested, uint256 available);
+    error EmptyTenderHash();
+    error EmptyFingerprint();
+    error NotAParty();
+    error RecordingNotAllowed();
+    error NoSuchEntry(uint256 number);
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -113,6 +152,13 @@ contract OMPilot {
     uint256 public acceptedAt; // unix time of acceptance (0 = not accepted)
 
     // ------------------------------------------------------------------
+    // The passport — entries are numbered from 1; entry n is _entries[n - 1]
+    // ------------------------------------------------------------------
+
+    Entry[] private _entries;
+    mapping(bytes32 => uint256[]) private _entriesByFingerprint;
+
+    // ------------------------------------------------------------------
     // Creation
     // ------------------------------------------------------------------
 
@@ -122,6 +168,7 @@ contract OMPilot {
         // Parties and token
         if (address(terms.token) == address(0) || terms.provider == address(0)) revert ZeroAddress();
         if (terms.provider == msg.sender) revert SameOwnerAndProvider();
+        if (terms.tenderHash == bytes32(0)) revert EmptyTenderHash();
 
         // Dates
         if (terms.startDate <= block.timestamp) revert StartNotInFuture();
@@ -167,6 +214,7 @@ contract OMPilot {
 
         accepted = true;
         acceptedAt = block.timestamp;
+        _addEntry(EntryKind.Acceptance, provider, tenderHash, 0, 0); // entry 1
         emit Accepted(provider, tenderHash, block.timestamp);
     }
 
@@ -230,6 +278,54 @@ contract OMPilot {
         uint256 bal = balance();
         uint256 locked = lockedAmount();
         return bal > locked ? bal - locked : 0;
+    }
+
+    // ------------------------------------------------------------------
+    // The passport: unpaid records, reading, verifying
+    // ------------------------------------------------------------------
+
+    /// The owner or the provider logs an unpaid record (no review, no payment),
+    /// from acceptance until the end date (decision 66).
+    function logRecord(RecordType recordType, bytes32 fingerprint) external returns (uint256 number) {
+        if (msg.sender != owner && msg.sender != provider) revert NotAParty();
+        if (!accepted || block.timestamp >= endDate) revert RecordingNotAllowed();
+        return _addEntry(EntryKind.UnpaidRecord, msg.sender, fingerprint, 0, uint8(recordType));
+    }
+
+    /// How many entries the passport holds (entries are numbered 1..entryCount).
+    function entryCount() external view returns (uint256) {
+        return _entries.length;
+    }
+
+    /// Everything about entry `number`.
+    function entry(uint256 number) external view returns (Entry memory) {
+        if (number == 0 || number > _entries.length) revert NoSuchEntry(number);
+        return _entries[number - 1];
+    }
+
+    /// Does entry `number` carry exactly this fingerprint? A number that doesn't
+    /// exist simply answers false, so anyone can check without risk of an error.
+    function verifyRecord(uint256 number, bytes32 candidateFingerprint) external view returns (bool) {
+        if (number == 0 || number > _entries.length) return false;
+        return _entries[number - 1].fingerprint == candidateFingerprint;
+    }
+
+    /// Every entry that used this fingerprint (empty if none) — so a verifier
+    /// holding a document needs no entry number.
+    function findEntries(bytes32 fingerprint) external view returns (uint256[] memory) {
+        return _entriesByFingerprint[fingerprint];
+    }
+
+    /// Writes the next entry. Every entry must carry a real fingerprint (decision 69).
+    function _addEntry(EntryKind kind, address author, bytes32 fingerprint, uint256 relatesTo, uint8 detail)
+        internal
+        returns (uint256 number)
+    {
+        if (fingerprint == bytes32(0)) revert EmptyFingerprint();
+        _entries.push(Entry(kind, author, block.timestamp, fingerprint, relatesTo, detail));
+        number = _entries.length;
+        _entriesByFingerprint[fingerprint].push(number);
+        emit EntryAdded(number, kind, author, fingerprint);
     }
 
     // ------------------------------------------------------------------
