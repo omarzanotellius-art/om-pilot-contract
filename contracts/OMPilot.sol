@@ -2,14 +2,18 @@
 pragma solidity 0.8.37;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title OMPilot — an O&M engagement as a smart contract
 /// @notice Learning project. Not audited. Testnet only. Not a security token.
 /// @dev Stage 1: part A — the tender terms, fixed at creation;
-///      part B — the provider's acceptance and the contract's status.
-///      Deposits, withdrawals and the lock follow in parts C–D;
+///      part B — the provider's acceptance and the contract's status;
+///      part C — the owner's deposits.
+///      Withdrawals and the lock follow in part D;
 ///      inspections, repairs and payments in Stage 2.
 contract OMPilot {
+    using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
+
     // ------------------------------------------------------------------
     // Types
     // ------------------------------------------------------------------
@@ -52,6 +56,9 @@ contract OMPilot {
     /// The provider accepted exactly these terms (identified by the tender hash).
     event Accepted(address indexed provider, bytes32 tenderHash, uint256 acceptedAt);
 
+    /// The owner deposited `amount`; `newBalance` is what the contract holds afterwards.
+    event Deposited(address indexed owner, uint256 amount, uint256 newBalance);
+
     // ------------------------------------------------------------------
     // Named refusals (decision 56)
     // ------------------------------------------------------------------
@@ -69,6 +76,9 @@ contract OMPilot {
     error NotProvider();
     error AlreadyAccepted();
     error AcceptanceWindowClosed();
+    error NotOwner();
+    error ZeroAmount();
+    error ContractNeverActivated();
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -160,6 +170,28 @@ contract OMPilot {
         bool started = block.timestamp >= startDate;
         if (!accepted) return started ? Status.NeverActivated : Status.AwaitingAcceptance;
         return started ? Status.Active : Status.Accepted;
+    }
+
+    // ------------------------------------------------------------------
+    // Money: deposits and balance
+    // ------------------------------------------------------------------
+
+    /// The owner deposits `amount` of the token. She must first approve this
+    /// contract on the token for at least `amount` (the standard two-step handshake);
+    /// otherwise the token itself refuses the transfer.
+    function deposit(uint256 amount) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (amount == 0) revert ZeroAmount();
+        if (status() == Status.NeverActivated) revert ContractNeverActivated();
+
+        token.safeTransferFrom(owner, address(this), amount);
+        emit Deposited(owner, amount, balance());
+    }
+
+    /// Everything the contract holds in the token (decision 58). Includes any
+    /// amount sent to it directly, which counts as the owner's money.
+    function balance() public view returns (uint256) {
+        return token.balanceOf(address(this));
     }
 
     // ------------------------------------------------------------------

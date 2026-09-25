@@ -4,14 +4,16 @@ pragma solidity 0.8.37;
 import {Test} from "forge-std/src/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {OMPilot} from "../../contracts/OMPilot.sol";
+import {MockUSDC} from "./MockUSDC.sol";
 
 /// Shared setup for all OMPilot tests: the cast, a fixed "now",
-/// valid Jupiter Ridge Solar terms, and deployment as Dana.
+/// the test-only stablecoin, valid Jupiter Ridge Solar terms, and deployment as Dana.
 abstract contract OMPilotTestBase is Test {
     address internal dana = makeAddr("dana"); // owner
     address internal luis = makeAddr("luis"); // provider
     address internal stranger = makeAddr("stranger");
-    IERC20 internal usdc = IERC20(makeAddr("usdc")); // stand-in address until a mock token is needed
+    MockUSDC internal mockUsdc = new MockUSDC(); // test-only stand-in for USDC (6 decimals)
+    IERC20 internal usdc = IERC20(address(mockUsdc));
 
     uint256 internal constant NOW = 1_000_000;
 
