@@ -12,9 +12,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///      entries — and unpaid records. Part 2: the inspection schedule (which
 ///      inspection is current, when it is due, whether its window is open).
 ///      Part 3a: submitting an inspection, the owner confirming, payment, and
-///      moving on to the next inspection.
-///      Still to come in Stage 2: rejection, resubmission and timeout payment (3b),
-///      misses, repair claims, and end of term (which completes the lock).
+///      moving on to the next inspection. Part 3b: rejection with a reason note,
+///      resubmission, and timeout payment triggered by anyone.
+///      Still to come in Stage 2: misses and cutoffs, repair claims, and end of
+///      term (which completes the lock).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -71,13 +72,15 @@ contract OMPilot {
     /// Where the current inspection's review stands.
     enum ReviewState {
         Open, // waiting for the provider's submission
-        PendingReview // a submission awaits the owner's decision
+        PendingReview, // a submission awaits the owner's decision
+        Rejected // rejected with a note; the provider may resubmit within the period
     }
 
     /// How a finished inspection ended.
     enum InspectionOutcome {
         None, // not finished
-        Confirmed // the owner confirmed it and the provider was paid
+        Confirmed, // the owner confirmed it and the provider was paid
+        PaidOnTimeout // the owner didn't decide in time; payment was triggered after the deadline
     }
 
     /// What is kept about each finished inspection.
@@ -143,6 +146,12 @@ contract OMPilot {
         uint256 indexed inspection, uint256 amount, InspectionOutcome outcome, address indexed triggeredBy
     );
 
+    /// The owner rejected the submission in `submissionEntry`, with her note in `noteEntry`.
+    /// The provider may resubmit strictly before `resubmitBy`.
+    event InspectionRejected(
+        uint256 indexed inspection, uint256 submissionEntry, uint256 noteEntry, uint256 resubmitBy
+    );
+
     // ------------------------------------------------------------------
     // Named refusals (decision 56)
     // ------------------------------------------------------------------
@@ -174,6 +183,9 @@ contract OMPilot {
     error InspectionUnfunded(uint256 required, uint256 balance);
     error NotPendingReview();
     error ReviewDeadlinePassed();
+    error ResubmissionPeriodOver();
+    error SameEvidenceAsRejected();
+    error ReviewStillOpen();
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -227,6 +239,12 @@ contract OMPilot {
     uint256 private _pendingEntry; // passport entry under review
     uint256 private _pendingSubmittedAt; // when it was submitted
     uint256 private _reviewDeadline; // decisions only strictly before this (decision 61)
+
+    /// The provider's time to resubmit after each rejection (a rule of procedure, §7).
+    uint256 public constant RESUBMISSION_PERIOD = 14 days;
+
+    uint256 private _resubmitDeadline; // resubmission only strictly before this
+    bytes32 private _rejectedFingerprint; // evidence of the attempt just rejected
 
     mapping(uint256 => InspectionRecord) private _inspectionRecords;
 
@@ -375,12 +393,21 @@ contract OMPilot {
     }
 
     /// The provider submits the current inspection: the fingerprint of the evidence
-    /// bundle and the finding. The window must be open and the fee covered.
+    /// bundle and the finding. A first submission needs the window open; a
+    /// resubmission after a rejection needs to be within the resubmission period,
+    /// with different evidence. The fee must be covered either way.
     function submitInspection(bytes32 fingerprint, Finding finding) external returns (uint256 entryNumber) {
         if (msg.sender != provider) revert NotProvider();
-        if (_review != ReviewState.Open) revert SubmissionNotExpected();
-        InspectionPhase phase = _inspectionPhase();
-        if (phase != InspectionPhase.WindowOpen) revert WindowNotOpen(phase);
+        if (_review == ReviewState.PendingReview) revert SubmissionNotExpected();
+        if (_review == ReviewState.Open) {
+            // First submission: the window must be open
+            InspectionPhase phase = _inspectionPhase();
+            if (phase != InspectionPhase.WindowOpen) revert WindowNotOpen(phase);
+        } else {
+            // Resubmission after a rejection: within the period, with different evidence
+            if (block.timestamp >= _resubmitDeadline) revert ResubmissionPeriodOver();
+            if (fingerprint == _rejectedFingerprint) revert SameEvidenceAsRejected();
+        }
         uint256 bal = balance();
         if (bal < inspectionRate) revert InspectionUnfunded(inspectionRate, bal);
 
@@ -400,6 +427,38 @@ contract OMPilot {
         if (_review != ReviewState.PendingReview) revert NotPendingReview();
         if (block.timestamp >= _reviewDeadline) revert ReviewDeadlinePassed();
         _settleAccepted(InspectionOutcome.Confirmed);
+    }
+
+    /// The owner rejects the submission under review, strictly before the deadline,
+    /// with the fingerprint of a rejection note (shared with the provider off-chain).
+    /// The note becomes its own passport entry; the provider may then resubmit.
+    function rejectInspection(bytes32 noteFingerprint) external returns (uint256 noteEntry) {
+        if (msg.sender != owner) revert NotOwner();
+        if (_review != ReviewState.PendingReview) revert NotPendingReview();
+        if (block.timestamp >= _reviewDeadline) revert ReviewDeadlinePassed();
+
+        uint256 submissionEntry = _pendingEntry;
+        noteEntry = _addEntry(EntryKind.RejectionNote, owner, noteFingerprint, submissionEntry, 0);
+        _rejectedFingerprint = _entries[submissionEntry - 1].fingerprint;
+        _resubmitDeadline = block.timestamp + RESUBMISSION_PERIOD;
+        _review = ReviewState.Rejected;
+        _pendingEntry = 0;
+        _pendingSubmittedAt = 0;
+        _reviewDeadline = 0;
+        emit InspectionRejected(currentInspection, submissionEntry, noteEntry, _resubmitDeadline);
+    }
+
+    /// Once the owner's deadline has passed without a decision, anyone may trigger
+    /// payment (decision 63). It always pays the provider; the event records who triggered it.
+    function claimInspectionOnTimeout() external {
+        if (_review != ReviewState.PendingReview) revert NotPendingReview();
+        if (block.timestamp < _reviewDeadline) revert ReviewStillOpen();
+        _settleAccepted(InspectionOutcome.PaidOnTimeout);
+    }
+
+    /// After a rejection: the resubmission deadline and the fingerprint that may not be reused.
+    function inspectionRework() external view returns (uint256 resubmitDeadline, bytes32 rejectedFingerprint) {
+        return (_resubmitDeadline, _rejectedFingerprint);
     }
 
     /// The review state of the current inspection.
@@ -434,6 +493,8 @@ contract OMPilot {
         _pendingEntry = 0;
         _pendingSubmittedAt = 0;
         _reviewDeadline = 0;
+        _resubmitDeadline = 0;
+        _rejectedFingerprint = bytes32(0);
 
         token.safeTransfer(provider, inspectionRate);
         emit InspectionPaid(number, inspectionRate, outcome, msg.sender);
