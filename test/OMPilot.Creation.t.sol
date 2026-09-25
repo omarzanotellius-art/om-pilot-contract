@@ -1,51 +1,15 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.37;
 
-import {Test} from "forge-std/src/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {OMPilot} from "../contracts/OMPilot.sol";
+import {OMPilotTestBase} from "./helpers/OMPilotTestBase.sol";
 
 /// Stage 1, part A — creating the contract with the tender terms.
 /// Each rule has a test showing it works and a test showing what it refuses.
-contract OMPilotCreationTest is Test {
-    address internal dana = makeAddr("dana"); // owner
-    address internal luis = makeAddr("luis"); // provider
-    IERC20 internal usdc = IERC20(makeAddr("usdc")); // stand-in address; no token needed for part A
-
-    uint256 internal constant NOW = 1_000_000;
-
-    function setUp() public {
-        vm.warp(NOW); // a realistic "current time" for the tests
-    }
-
-    // --- helpers -------------------------------------------------------
-
-    /// Valid terms, based on the Jupiter Ridge Solar story (USDC has 6 decimals).
-    function validTerms() internal view returns (OMPilot.Terms memory t) {
-        t.provider = luis;
-        t.token = usdc;
-        t.assetName = "Jupiter Ridge Solar";
-        t.tenderHash = sha256("signed tender award");
-        t.startDate = NOW + 30 days;
-        t.endDate = NOW + 30 days + 730 days;
-        t.inspectionInterval = 182 days;
-        t.tolerance = 14 days;
-        t.inspectionRate = 1_500e6;
-        t.repairBudget = 2_000e6;
-    }
-
-    function validPriceList() internal pure returns (OMPilot.PriceItem[] memory list) {
-        list = new OMPilot.PriceItem[](4);
-        list[0] = OMPilot.PriceItem("String fuse replacement", 150e6);
-        list[1] = OMPilot.PriceItem("Connector replacement", 90e6);
-        list[2] = OMPilot.PriceItem("Inverter reset visit", 250e6);
-        list[3] = OMPilot.PriceItem("Combiner breaker replacement", 400e6);
-    }
-
-    function deployAsDana(OMPilot.Terms memory t, OMPilot.PriceItem[] memory list) internal returns (OMPilot) {
-        vm.prank(dana); // the next call comes from Dana, so she becomes the owner
-        return new OMPilot(t, list);
-    }
+/// Shared cast, clock and valid terms live in helpers/OMPilotTestBase.sol.
+contract OMPilotCreationTest is OMPilotTestBase {
+    // --- helper --------------------------------------------------------
 
     function expectRefusal(OMPilot.Terms memory t, OMPilot.PriceItem[] memory list, bytes memory reason) internal {
         vm.expectRevert(reason);

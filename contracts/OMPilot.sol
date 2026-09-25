@@ -5,8 +5,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title OMPilot — an O&M engagement as a smart contract
 /// @notice Learning project. Not audited. Testnet only. Not a security token.
-/// @dev Stage 1, part A: the tender terms, fixed at creation.
-///      Acceptance, deposits, withdrawals and the lock follow in parts B–D;
+/// @dev Stage 1: part A — the tender terms, fixed at creation;
+///      part B — the provider's acceptance and the contract's status.
+///      Deposits, withdrawals and the lock follow in parts C–D;
 ///      inspections, repairs and payments in Stage 2.
 contract OMPilot {
     // ------------------------------------------------------------------
@@ -34,6 +35,23 @@ contract OMPilot {
         uint256 repairBudget; // pre-authorised repairs per period, in token units (may be 0)
     }
 
+    /// Where the engagement stands. Worked out from the clock and from
+    /// whether the provider has accepted — never stored, so nobody has to
+    /// send a transaction to "switch it on" at the start date.
+    enum Status {
+        AwaitingAcceptance, // before the start date, not yet accepted
+        Accepted, // accepted, start date not yet reached
+        Active, // accepted, start date reached
+        NeverActivated // start date reached without acceptance
+    }
+
+    // ------------------------------------------------------------------
+    // Public announcements (events) — readable on the block explorer
+    // ------------------------------------------------------------------
+
+    /// The provider accepted exactly these terms (identified by the tender hash).
+    event Accepted(address indexed provider, bytes32 tenderHash, uint256 acceptedAt);
+
     // ------------------------------------------------------------------
     // Named refusals (decision 56)
     // ------------------------------------------------------------------
@@ -48,6 +66,9 @@ contract OMPilot {
     error ZeroRate();
     error EmptyPriceList();
     error InvalidPriceItem(uint256 index);
+    error NotProvider();
+    error AlreadyAccepted();
+    error AcceptanceWindowClosed();
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -68,6 +89,13 @@ contract OMPilot {
     /// here, and simply no function exists that could edit them.
     string public assetName;
     PriceItem[] private _priceList;
+
+    // ------------------------------------------------------------------
+    // Acceptance — the only things that change in part B
+    // ------------------------------------------------------------------
+
+    bool public accepted;
+    uint256 public acceptedAt; // unix time of acceptance (0 = not accepted)
 
     // ------------------------------------------------------------------
     // Creation
@@ -110,6 +138,28 @@ contract OMPilot {
         inspectionRate = terms.inspectionRate;
         repairBudget = terms.repairBudget;
         assetName = terms.assetName;
+    }
+
+    // ------------------------------------------------------------------
+    // Acceptance and status
+    // ------------------------------------------------------------------
+
+    /// The provider accepts the terms. Only once, and strictly before the start date.
+    function accept() external {
+        if (msg.sender != provider) revert NotProvider();
+        if (accepted) revert AlreadyAccepted();
+        if (block.timestamp >= startDate) revert AcceptanceWindowClosed();
+
+        accepted = true;
+        acceptedAt = block.timestamp;
+        emit Accepted(provider, tenderHash, block.timestamp);
+    }
+
+    /// Where the engagement stands right now (see `Status`).
+    function status() public view returns (Status) {
+        bool started = block.timestamp >= startDate;
+        if (!accepted) return started ? Status.NeverActivated : Status.AwaitingAcceptance;
+        return started ? Status.Active : Status.Accepted;
     }
 
     // ------------------------------------------------------------------
