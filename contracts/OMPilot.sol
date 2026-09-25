@@ -9,9 +9,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /// @dev Stage 1 (complete): the tender terms, fixed at creation; the provider's
 ///      acceptance and the contract's status; deposits; withdrawals and the lock.
 ///      Stage 2, part 1: the passport — one numbered logbook of fingerprinted
-///      entries — and unpaid records.
-///      Still to come in Stage 2: the inspection schedule, review and payment,
-///      misses, repair claims, and end of term (which completes the lock).
+///      entries — and unpaid records. Part 2: the inspection schedule (which
+///      inspection is current, when it is due, whether its window is open).
+///      Still to come in Stage 2: review and payment, misses, repair claims,
+///      and end of term (which completes the lock).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -48,6 +49,14 @@ contract OMPilot {
         Accepted, // accepted, start date not yet reached
         Active, // accepted, start date reached
         NeverActivated // start date reached without acceptance
+    }
+
+    /// Where the current inspection stands (worked out from the clock, never stored).
+    enum InspectionPhase {
+        NotYetDue, // before its due date: submissions would be too early
+        WindowOpen, // from the due moment until just before due + tolerance
+        WindowClosed, // the window has closed without (part 4 turns this into a miss)
+        NoneScheduled // no more inspections: next due date after the end date, or never activated
     }
 
     /// The kinds of entry in the passport (the numbered logbook).
@@ -159,6 +168,13 @@ contract OMPilot {
     mapping(bytes32 => uint256[]) private _entriesByFingerprint;
 
     // ------------------------------------------------------------------
+    // The inspection schedule — only two facts are kept
+    // ------------------------------------------------------------------
+
+    uint256 public currentInspection; // number of the current inspection (starts at 1)
+    uint256 private _currentDue; // its due date (unix time)
+
+    // ------------------------------------------------------------------
     // Creation
     // ------------------------------------------------------------------
 
@@ -200,6 +216,10 @@ contract OMPilot {
         inspectionRate = terms.inspectionRate;
         repairBudget = terms.repairBudget;
         assetName = terms.assetName;
+
+        // Inspection #1 is due one interval after the start (§8.3)
+        currentInspection = 1;
+        _currentDue = terms.startDate + terms.inspectionInterval;
     }
 
     // ------------------------------------------------------------------
@@ -278,6 +298,31 @@ contract OMPilot {
         uint256 bal = balance();
         uint256 locked = lockedAmount();
         return bal > locked ? bal - locked : 0;
+    }
+
+    // ------------------------------------------------------------------
+    // The inspection schedule
+    // ------------------------------------------------------------------
+
+    /// The current inspection: its number, due date, the moment its window closes
+    /// (strictly before — decision 72) and its phase. An inspection due on or before
+    /// the end date belongs to the term (decision 73).
+    function currentInspectionInfo()
+        external
+        view
+        returns (uint256 number, uint256 dueDate, uint256 windowClosesAt, InspectionPhase phase)
+    {
+        number = currentInspection;
+        dueDate = _currentDue;
+        windowClosesAt = _currentDue + tolerance;
+        phase = _inspectionPhase();
+    }
+
+    function _inspectionPhase() internal view returns (InspectionPhase) {
+        if (status() == Status.NeverActivated || _currentDue > endDate) return InspectionPhase.NoneScheduled;
+        if (block.timestamp < _currentDue) return InspectionPhase.NotYetDue;
+        if (block.timestamp < _currentDue + tolerance) return InspectionPhase.WindowOpen;
+        return InspectionPhase.WindowClosed;
     }
 
     // ------------------------------------------------------------------
