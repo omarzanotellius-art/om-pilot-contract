@@ -11,8 +11,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///      Stage 2, part 1: the passport — one numbered logbook of fingerprinted
 ///      entries — and unpaid records. Part 2: the inspection schedule (which
 ///      inspection is current, when it is due, whether its window is open).
-///      Still to come in Stage 2: review and payment, misses, repair claims,
-///      and end of term (which completes the lock).
+///      Part 3a: submitting an inspection, the owner confirming, payment, and
+///      moving on to the next inspection.
+///      Still to come in Stage 2: rejection, resubmission and timeout payment (3b),
+///      misses, repair claims, and end of term (which completes the lock).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -57,6 +59,33 @@ contract OMPilot {
         WindowOpen, // from the due moment until just before due + tolerance
         WindowClosed, // the window has closed without (part 4 turns this into a miss)
         NoneScheduled // no more inspections: next due date after the end date, or never activated
+    }
+
+    /// What the provider found at an inspection. Recorded publicly; it does not
+    /// affect payment, which is for the inspection service (decision 60).
+    enum Finding {
+        NoIssuesFound,
+        IssuesFound
+    }
+
+    /// Where the current inspection's review stands.
+    enum ReviewState {
+        Open, // waiting for the provider's submission
+        PendingReview // a submission awaits the owner's decision
+    }
+
+    /// How a finished inspection ended.
+    enum InspectionOutcome {
+        None, // not finished
+        Confirmed // the owner confirmed it and the provider was paid
+    }
+
+    /// What is kept about each finished inspection.
+    struct InspectionRecord {
+        InspectionOutcome outcome;
+        Finding finding; // the finding of the accepted attempt
+        uint256 acceptedAt; // when the accepted attempt was submitted
+        uint256 acceptedEntry; // its passport entry number
     }
 
     /// The kinds of entry in the passport (the numbered logbook).
@@ -106,6 +135,14 @@ contract OMPilot {
     /// A new passport entry was written.
     event EntryAdded(uint256 indexed number, EntryKind kind, address indexed author, bytes32 fingerprint);
 
+    /// The provider submitted inspection `inspection` as passport entry `entryNumber`.
+    event InspectionSubmitted(uint256 indexed inspection, uint256 entryNumber, Finding finding);
+
+    /// Inspection `inspection` was paid; `triggeredBy` sent the transaction that settled it.
+    event InspectionPaid(
+        uint256 indexed inspection, uint256 amount, InspectionOutcome outcome, address indexed triggeredBy
+    );
+
     // ------------------------------------------------------------------
     // Named refusals (decision 56)
     // ------------------------------------------------------------------
@@ -132,6 +169,11 @@ contract OMPilot {
     error NotAParty();
     error RecordingNotAllowed();
     error NoSuchEntry(uint256 number);
+    error WindowNotOpen(InspectionPhase phase);
+    error SubmissionNotExpected();
+    error InspectionUnfunded(uint256 required, uint256 balance);
+    error NotPendingReview();
+    error ReviewDeadlinePassed();
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -173,6 +215,20 @@ contract OMPilot {
 
     uint256 public currentInspection; // number of the current inspection (starts at 1)
     uint256 private _currentDue; // its due date (unix time)
+
+    // ------------------------------------------------------------------
+    // Review of the current inspection, and records of finished ones
+    // ------------------------------------------------------------------
+
+    /// The owner's time to decide on each submission (a rule of procedure, §7).
+    uint256 public constant REVIEW_WINDOW = 7 days;
+
+    ReviewState private _review;
+    uint256 private _pendingEntry; // passport entry under review
+    uint256 private _pendingSubmittedAt; // when it was submitted
+    uint256 private _reviewDeadline; // decisions only strictly before this (decision 61)
+
+    mapping(uint256 => InspectionRecord) private _inspectionRecords;
 
     // ------------------------------------------------------------------
     // Creation
@@ -316,6 +372,71 @@ contract OMPilot {
         dueDate = _currentDue;
         windowClosesAt = _currentDue + tolerance;
         phase = _inspectionPhase();
+    }
+
+    /// The provider submits the current inspection: the fingerprint of the evidence
+    /// bundle and the finding. The window must be open and the fee covered.
+    function submitInspection(bytes32 fingerprint, Finding finding) external returns (uint256 entryNumber) {
+        if (msg.sender != provider) revert NotProvider();
+        if (_review != ReviewState.Open) revert SubmissionNotExpected();
+        InspectionPhase phase = _inspectionPhase();
+        if (phase != InspectionPhase.WindowOpen) revert WindowNotOpen(phase);
+        uint256 bal = balance();
+        if (bal < inspectionRate) revert InspectionUnfunded(inspectionRate, bal);
+
+        entryNumber =
+            _addEntry(EntryKind.InspectionSubmission, provider, fingerprint, currentInspection, uint8(finding));
+        _review = ReviewState.PendingReview;
+        _pendingEntry = entryNumber;
+        _pendingSubmittedAt = block.timestamp;
+        _reviewDeadline = block.timestamp + REVIEW_WINDOW;
+        emit InspectionSubmitted(currentInspection, entryNumber, finding);
+    }
+
+    /// The owner confirms the submission under review, strictly before the deadline.
+    /// The provider is paid the inspection rate, and the next inspection is scheduled.
+    function confirmInspection() external {
+        if (msg.sender != owner) revert NotOwner();
+        if (_review != ReviewState.PendingReview) revert NotPendingReview();
+        if (block.timestamp >= _reviewDeadline) revert ReviewDeadlinePassed();
+        _settleAccepted(InspectionOutcome.Confirmed);
+    }
+
+    /// The review state of the current inspection.
+    function inspectionReview()
+        external
+        view
+        returns (ReviewState state, uint256 pendingEntry, uint256 submittedAt, uint256 reviewDeadline)
+    {
+        return (_review, _pendingEntry, _pendingSubmittedAt, _reviewDeadline);
+    }
+
+    /// What is recorded about inspection `number` once finished (outcome None if not).
+    function inspectionRecord(uint256 number) external view returns (InspectionRecord memory) {
+        return _inspectionRecords[number];
+    }
+
+    /// Records the accepted inspection, schedules the next one, then pays.
+    /// Records first, money last (checks, effects, interactions).
+    function _settleAccepted(InspectionOutcome outcome) internal {
+        uint256 number = currentInspection;
+        _inspectionRecords[number] = InspectionRecord({
+            outcome: outcome,
+            finding: Finding(_entries[_pendingEntry - 1].detail),
+            acceptedAt: _pendingSubmittedAt,
+            acceptedEntry: _pendingEntry
+        });
+
+        // Next inspection: one interval after the accepted submission (§8.3)
+        currentInspection = number + 1;
+        _currentDue = _pendingSubmittedAt + inspectionInterval;
+        _review = ReviewState.Open;
+        _pendingEntry = 0;
+        _pendingSubmittedAt = 0;
+        _reviewDeadline = 0;
+
+        token.safeTransfer(provider, inspectionRate);
+        emit InspectionPaid(number, inspectionRate, outcome, msg.sender);
     }
 
     function _inspectionPhase() internal view returns (InspectionPhase) {
