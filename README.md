@@ -4,7 +4,7 @@ A learning project: one Solidity smart contract that keeps a hash-anchored audit
 
 It is a learning exercise, built in the open to show asset owners and operators how a smart contract can work in day-to-day operations. It is **not** a security token, and it has nothing to do with tokenising or selling an asset.
 
-> **Status:** work in progress — Stage 0 (setup). Nothing here is finished or deployed.
+> **Status:** work in progress — Stage 1 (core contract) complete: tender terms, provider acceptance, deposits, withdrawals and the reserved-funds lock, with tests. Next: Stage 2 (inspections, repairs and payments). Nothing is deployed.
 
 ## Read this first
 

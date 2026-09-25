@@ -8,9 +8,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /// @notice Learning project. Not audited. Testnet only. Not a security token.
 /// @dev Stage 1: part A — the tender terms, fixed at creation;
 ///      part B — the provider's acceptance and the contract's status;
-///      part C — the owner's deposits.
-///      Withdrawals and the lock follow in part D;
-///      inspections, repairs and payments in Stage 2.
+///      part C — the owner's deposits;
+///      part D — withdrawals and the rolling lock.
+///      Inspections, repairs and payments follow in Stage 2, which also makes
+///      the lock shrink with payments and reset each budget period.
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -59,6 +60,9 @@ contract OMPilot {
     /// The owner deposited `amount`; `newBalance` is what the contract holds afterwards.
     event Deposited(address indexed owner, uint256 amount, uint256 newBalance);
 
+    /// The owner withdrew `amount`; `newBalance` is what the contract holds afterwards.
+    event Withdrawn(address indexed owner, uint256 amount, uint256 newBalance);
+
     // ------------------------------------------------------------------
     // Named refusals (decision 56)
     // ------------------------------------------------------------------
@@ -79,6 +83,7 @@ contract OMPilot {
     error NotOwner();
     error ZeroAmount();
     error ContractNeverActivated();
+    error WithdrawalExceedsUnlocked(uint256 requested, uint256 available);
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -192,6 +197,39 @@ contract OMPilot {
     /// amount sent to it directly, which counts as the owner's money.
     function balance() public view returns (uint256) {
         return token.balanceOf(address(this));
+    }
+
+    /// The owner withdraws `amount`, always to her own address (there is no
+    /// "send to" field). At most the unlocked part of the balance.
+    function withdraw(uint256 amount) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (amount == 0) revert ZeroAmount();
+        uint256 available = availableToWithdraw();
+        if (amount > available) revert WithdrawalExceedsUnlocked(amount, available);
+
+        token.safeTransfer(owner, amount);
+        emit Withdrawn(owner, amount, balance());
+    }
+
+    // ------------------------------------------------------------------
+    // The rolling lock (Stage 1 version)
+    // ------------------------------------------------------------------
+
+    /// Money reserved for the provider, which the owner cannot withdraw.
+    /// Zero until the provider accepts (decision 53) — so also zero if the
+    /// contract never activated. Once accepted: the next inspection's fee plus
+    /// the repair budget. (Stage 2 makes this shrink with payments and reset
+    /// each budget period.)
+    function lockedAmount() public view returns (uint256) {
+        if (!accepted) return 0;
+        return inspectionRate + repairBudget;
+    }
+
+    /// What the owner can withdraw right now: balance minus lock, never below zero.
+    function availableToWithdraw() public view returns (uint256) {
+        uint256 bal = balance();
+        uint256 locked = lockedAmount();
+        return bal > locked ? bal - locked : 0;
     }
 
     // ------------------------------------------------------------------
