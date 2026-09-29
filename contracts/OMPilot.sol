@@ -13,9 +13,11 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///      inspection is current, when it is due, whether its window is open).
 ///      Part 3a: submitting an inspection, the owner confirming, payment, and
 ///      moving on to the next inspection. Part 3b: rejection with a reason note,
-///      resubmission, and timeout payment triggered by anyone.
-///      Still to come in Stage 2: misses and cutoffs, repair claims, and end of
-///      term (which completes the lock).
+///      resubmission, and timeout payment triggered by anyone. Part 4a: misses
+///      (window closed; resubmission period over), "missed (unfunded)", automatic
+///      settling, and recording misses by anyone.
+///      Still to come in Stage 2: cutoffs (4b), repair claims, and end of term
+///      (which completes the lock).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -80,15 +82,26 @@ contract OMPilot {
     enum InspectionOutcome {
         None, // not finished
         Confirmed, // the owner confirmed it and the provider was paid
-        PaidOnTimeout // the owner didn't decide in time; payment was triggered after the deadline
+        PaidOnTimeout, // the owner didn't decide in time; payment was triggered after the deadline
+        Missed // not completed in time: no payment (see MissReason)
+    }
+
+    /// Why a missed inspection counts as missed (decision 32).
+    enum MissReason {
+        None, // not missed
+        Missed, // the provider's side
+        MissedUnfunded // the fee was not covered at some point during the window: the owner's side
     }
 
     /// What is kept about each finished inspection.
     struct InspectionRecord {
         InspectionOutcome outcome;
-        Finding finding; // the finding of the accepted attempt
+        Finding finding; // the finding of the accepted attempt (meaningless if missed)
         uint256 acceptedAt; // when the accepted attempt was submitted
         uint256 acceptedEntry; // its passport entry number
+        MissReason missReason; // why it was missed (None if not missed)
+        uint256 missedAt; // when the miss actually happened (e.g. the moment the window closed)
+        address recordedBy; // who sent the transaction that recorded the miss
     }
 
     /// The kinds of entry in the passport (the numbered logbook).
@@ -146,6 +159,12 @@ contract OMPilot {
         uint256 indexed inspection, uint256 amount, InspectionOutcome outcome, address indexed triggeredBy
     );
 
+    /// Inspection `inspection` was missed at `missedAt`; `recordedBy` sent the
+    /// transaction that recorded it (explicitly, or automatically as part of another action).
+    event InspectionMissed(
+        uint256 indexed inspection, MissReason reason, uint256 missedAt, address indexed recordedBy
+    );
+
     /// The owner rejected the submission in `submissionEntry`, with her note in `noteEntry`.
     /// The provider may resubmit strictly before `resubmitBy`.
     event InspectionRejected(
@@ -186,6 +205,7 @@ contract OMPilot {
     error ResubmissionPeriodOver();
     error SameEvidenceAsRejected();
     error ReviewStillOpen();
+    error NothingToRecord();
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -245,6 +265,11 @@ contract OMPilot {
 
     uint256 private _resubmitDeadline; // resubmission only strictly before this
     bytes32 private _rejectedFingerprint; // evidence of the attempt just rejected
+
+    /// Since when the inspection fee has been continuously covered by the balance,
+    /// as seen by the contract (0 = not covered when last seen). Re-checked at every
+    /// action; money sent directly counts from the next action onwards (decision 76).
+    uint256 private _coveredSince;
 
     mapping(uint256 => InspectionRecord) private _inspectionRecords;
 
@@ -309,6 +334,7 @@ contract OMPilot {
         accepted = true;
         acceptedAt = block.timestamp;
         _addEntry(EntryKind.Acceptance, provider, tenderHash, 0, 0); // entry 1
+        _updateCoverage();
         emit Accepted(provider, tenderHash, block.timestamp);
     }
 
@@ -332,6 +358,7 @@ contract OMPilot {
         if (status() == Status.NeverActivated) revert ContractNeverActivated();
 
         token.safeTransferFrom(owner, address(this), amount);
+        _updateCoverage();
         emit Deposited(owner, amount, balance());
     }
 
@@ -350,6 +377,7 @@ contract OMPilot {
         if (amount > available) revert WithdrawalExceedsUnlocked(amount, available);
 
         token.safeTransfer(owner, amount);
+        _updateCoverage();
         emit Withdrawn(owner, amount, balance());
     }
 
@@ -398,6 +426,16 @@ contract OMPilot {
     /// with different evidence. The fee must be covered either way.
     function submitInspection(bytes32 fingerprint, Finding finding) external returns (uint256 entryNumber) {
         if (msg.sender != provider) revert NotProvider();
+
+        // Record any overdue misses first (decision 65). If that happened but the
+        // submission still can't go through, report the ORIGINAL problem — Luis was
+        // too late for the inspection he meant — rather than the next one's (decision 77).
+        bool wasResubmissionLate = _review == ReviewState.Rejected && block.timestamp >= _resubmitDeadline;
+        if (_settleOverdueMisses() > 0 && _inspectionPhase() != InspectionPhase.WindowOpen) {
+            if (wasResubmissionLate) revert ResubmissionPeriodOver();
+            revert WindowNotOpen(InspectionPhase.WindowClosed);
+        }
+        _updateCoverage();
         if (_review == ReviewState.PendingReview) revert SubmissionNotExpected();
         if (_review == ReviewState.Open) {
             // First submission: the window must be open
@@ -445,6 +483,7 @@ contract OMPilot {
         _pendingEntry = 0;
         _pendingSubmittedAt = 0;
         _reviewDeadline = 0;
+        _updateCoverage();
         emit InspectionRejected(currentInspection, submissionEntry, noteEntry, _resubmitDeadline);
     }
 
@@ -483,7 +522,10 @@ contract OMPilot {
             outcome: outcome,
             finding: Finding(_entries[_pendingEntry - 1].detail),
             acceptedAt: _pendingSubmittedAt,
-            acceptedEntry: _pendingEntry
+            acceptedEntry: _pendingEntry,
+            missReason: MissReason.None,
+            missedAt: 0,
+            recordedBy: address(0)
         });
 
         // Next inspection: one interval after the accepted submission (§8.3)
@@ -497,7 +539,77 @@ contract OMPilot {
         _rejectedFingerprint = bytes32(0);
 
         token.safeTransfer(provider, inspectionRate);
+        _updateCoverage(); // the next inspection's fee may no longer be covered
         emit InspectionPaid(number, inspectionRate, outcome, msg.sender);
+    }
+
+    // ------------------------------------------------------------------
+    // Misses (part 4a): recorded explicitly by anyone, or automatically
+    // ------------------------------------------------------------------
+
+    /// Anyone may record overdue misses (decision 65). Records every inspection
+    /// that is overdue right now, oldest first; refused if there is nothing to record.
+    function markMissed() external returns (uint256 recorded) {
+        recorded = _settleOverdueMisses();
+        if (recorded == 0) revert NothingToRecord();
+        _updateCoverage();
+    }
+
+    /// Records every overdue miss, oldest first, moving the schedule on after each.
+    /// (a) the window closed with no first submission;
+    /// (b) the resubmission period ran out after a rejection.
+    /// Cutoffs (c) follow in part 4b.
+    function _settleOverdueMisses() internal returns (uint256 count) {
+        while (status() != Status.NeverActivated && _currentDue <= endDate) {
+            if (_review == ReviewState.Open && block.timestamp >= _currentDue + tolerance) {
+                _recordMiss(_windowMissReason(), _currentDue + tolerance);
+            } else if (_review == ReviewState.Rejected && block.timestamp >= _resubmitDeadline) {
+                _recordMiss(MissReason.Missed, _resubmitDeadline);
+            } else {
+                break;
+            }
+            ++count;
+        }
+    }
+
+    /// A window miss is the owner's side if the fee was not continuously covered
+    /// from the due moment on — as far as the contract has seen (decision 76).
+    function _windowMissReason() internal view returns (MissReason) {
+        if (_coveredSince == 0 || _coveredSince > _currentDue) return MissReason.MissedUnfunded;
+        return MissReason.Missed;
+    }
+
+    /// Records the current inspection as missed; the next is due one interval
+    /// after the missed due date (§8.3). No payment.
+    function _recordMiss(MissReason reason, uint256 missedAt) internal {
+        uint256 number = currentInspection;
+        _inspectionRecords[number] = InspectionRecord({
+            outcome: InspectionOutcome.Missed,
+            finding: Finding.NoIssuesFound,
+            acceptedAt: 0,
+            acceptedEntry: 0,
+            missReason: reason,
+            missedAt: missedAt,
+            recordedBy: msg.sender
+        });
+        currentInspection = number + 1;
+        _currentDue = _currentDue + inspectionInterval;
+        _review = ReviewState.Open;
+        _pendingEntry = 0;
+        _pendingSubmittedAt = 0;
+        _reviewDeadline = 0;
+        _resubmitDeadline = 0;
+        _rejectedFingerprint = bytes32(0);
+        emit InspectionMissed(number, reason, missedAt, msg.sender);
+    }
+
+    /// Re-checks whether the inspection fee is covered, and since when.
+    function _updateCoverage() internal {
+        if (balance() < inspectionRate) {
+            _coveredSince = 0;
+        } else if (_coveredSince == 0) {
+            _coveredSince = block.timestamp;
+        }
     }
 
     function _inspectionPhase() internal view returns (InspectionPhase) {
@@ -516,6 +628,7 @@ contract OMPilot {
     function logRecord(RecordType recordType, bytes32 fingerprint) external returns (uint256 number) {
         if (msg.sender != owner && msg.sender != provider) revert NotAParty();
         if (!accepted || block.timestamp >= endDate) revert RecordingNotAllowed();
+        _updateCoverage();
         return _addEntry(EntryKind.UnpaidRecord, msg.sender, fingerprint, 0, uint8(recordType));
     }
 
