@@ -15,9 +15,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///      moving on to the next inspection. Part 3b: rejection with a reason note,
 ///      resubmission, and timeout payment triggered by anyone. Part 4a: misses
 ///      (window closed; resubmission period over), "missed (unfunded)", automatic
-///      settling, and recording misses by anyone.
-///      Still to come in Stage 2: cutoffs (4b), repair claims, and end of term
-///      (which completes the lock).
+///      settling, and recording misses by anyone. Part 4b: cutoffs — a dispute
+///      can't run on into the next inspection.
+///      Still to come in Stage 2: repair claims, and end of term (which completes
+///      the lock and adds the end-of-term cutoff).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -271,6 +272,9 @@ contract OMPilot {
     /// action; money sent directly counts from the next action onwards (decision 76).
     uint256 private _coveredSince;
 
+    /// Whether the one extra resubmission chance after the cutoff has been given.
+    bool private _postCutoffChanceUsed;
+
     mapping(uint256 => InspectionRecord) private _inspectionRecords;
 
     // ------------------------------------------------------------------
@@ -477,14 +481,43 @@ contract OMPilot {
 
         uint256 submissionEntry = _pendingEntry;
         noteEntry = _addEntry(EntryKind.RejectionNote, owner, noteFingerprint, submissionEntry, 0);
+
+        // Cutoff rules (§8.5)
+        uint256 cutoff = _cutoff();
+        if (block.timestamp >= cutoff && _postCutoffChanceUsed) {
+            // Second rejection after the cutoff: the review of the extra chance is final.
+            emit InspectionRejected(currentInspection, submissionEntry, noteEntry, 0);
+            _recordMiss(MissReason.Missed, block.timestamp);
+            _updateCoverage();
+            return noteEntry;
+        }
+        uint256 resubmitBy = block.timestamp + RESUBMISSION_PERIOD;
+        if (block.timestamp >= cutoff) {
+            _postCutoffChanceUsed = true; // exactly one further, full resubmission period
+        } else if (resubmitBy > cutoff) {
+            resubmitBy = cutoff; // a cutoff shortens a resubmission period that runs into it
+        }
+
         _rejectedFingerprint = _entries[submissionEntry - 1].fingerprint;
-        _resubmitDeadline = block.timestamp + RESUBMISSION_PERIOD;
+        _resubmitDeadline = resubmitBy;
         _review = ReviewState.Rejected;
         _pendingEntry = 0;
         _pendingSubmittedAt = 0;
         _reviewDeadline = 0;
         _updateCoverage();
-        emit InspectionRejected(currentInspection, submissionEntry, noteEntry, _resubmitDeadline);
+        emit InspectionRejected(currentInspection, submissionEntry, noteEntry, resubmitBy);
+    }
+
+    /// The current inspection's cutoff — when the next inspection would be due —
+    /// and whether the one extra chance after it has been used.
+    function inspectionCutoff() external view returns (uint256 cutoff, bool postCutoffChanceUsed) {
+        return (_cutoff(), _postCutoffChanceUsed);
+    }
+
+    /// The moment the next inspection would be due: one interval after the
+    /// current inspection's due date (§8.5).
+    function _cutoff() internal view returns (uint256) {
+        return _currentDue + inspectionInterval;
     }
 
     /// Once the owner's deadline has passed without a decision, anyone may trigger
@@ -537,6 +570,7 @@ contract OMPilot {
         _reviewDeadline = 0;
         _resubmitDeadline = 0;
         _rejectedFingerprint = bytes32(0);
+        _postCutoffChanceUsed = false;
 
         token.safeTransfer(provider, inspectionRate);
         _updateCoverage(); // the next inspection's fee may no longer be covered
@@ -557,8 +591,9 @@ contract OMPilot {
 
     /// Records every overdue miss, oldest first, moving the schedule on after each.
     /// (a) the window closed with no first submission;
-    /// (b) the resubmission period ran out after a rejection.
-    /// Cutoffs (c) follow in part 4b.
+    /// (b) the resubmission period ran out after a rejection — including one
+    ///     shortened by the cutoff, which is how (c) a dispute unresolved at its
+    ///     cutoff becomes a miss. A submission awaiting review is never settled here.
     function _settleOverdueMisses() internal returns (uint256 count) {
         while (status() != Status.NeverActivated && _currentDue <= endDate) {
             if (_review == ReviewState.Open && block.timestamp >= _currentDue + tolerance) {
@@ -600,6 +635,7 @@ contract OMPilot {
         _reviewDeadline = 0;
         _resubmitDeadline = 0;
         _rejectedFingerprint = bytes32(0);
+        _postCutoffChanceUsed = false;
         emit InspectionMissed(number, reason, missedAt, msg.sender);
     }
 
