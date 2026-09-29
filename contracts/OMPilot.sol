@@ -20,7 +20,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///      confirm, pay), budget periods, the full lock (decision 59), available budget.
 ///      Part 5b: claim rejection with a note, resubmission with new evidence only,
 ///      the 3-attempt limit, timeout payment by anyone, and lapses.
-///      Still to come in Stage 2: end of term (6).
+///      Part 6: end of term — Ended/Closed statuses, the lock released step by
+///      step, and the end-of-term cutoff for inspections and claims.
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -56,7 +57,9 @@ contract OMPilot {
         AwaitingAcceptance, // before the start date, not yet accepted
         Accepted, // accepted, start date not yet reached
         Active, // accepted, start date reached
-        NeverActivated // start date reached without acceptance
+        NeverActivated, // start date reached without acceptance
+        Ended, // after the end date, while an item is still open (settling)
+        Closed // after the end date, nothing open
     }
 
     /// Where the current inspection stands (worked out from the clock, never stored).
@@ -416,7 +419,15 @@ contract OMPilot {
     function status() public view returns (Status) {
         bool started = block.timestamp >= startDate;
         if (!accepted) return started ? Status.NeverActivated : Status.AwaitingAcceptance;
-        return started ? Status.Active : Status.Accepted;
+        if (!started) return Status.Accepted;
+        if (block.timestamp < endDate) return Status.Active;
+        return _hasOpenItems() ? Status.Ended : Status.Closed;
+    }
+
+    /// Anything still open: an inspection due within the term but not yet resolved
+    /// (including an overdue miss not yet recorded), or a claim under review or rework.
+    function _hasOpenItems() internal view returns (bool) {
+        return _currentDue <= endDate || _totalPending > 0;
     }
 
     // ------------------------------------------------------------------
@@ -465,9 +476,12 @@ contract OMPilot {
     /// unresolved inspection (if one is still scheduled in the term) + this budget
     /// period's budget minus what has been paid this period + claims still pending
     /// from earlier periods. Pending claims of this period sit inside the budget term.
-    /// (After the end date the lock is released step by step: part 6.)
+    /// After the end date (decision 67): only what is still open — an unresolved
+    /// inspection's fee and pending claims. The unused budget is released at once,
+    /// each item as it resolves, and the lock is zero once Closed.
     function lockedAmount() public view returns (uint256) {
         if (!accepted) return 0;
+        if (block.timestamp >= endDate) return _scheduledFee() + _totalPending;
         uint256 period = currentPeriod();
         uint256 earlierPending = _totalPending - _pendingInPeriod[period];
         return _scheduledFee() + (repairBudget - _paidInPeriod[period]) + earlierPending;
@@ -593,10 +607,13 @@ contract OMPilot {
         return (_cutoff(), _postCutoffChanceUsed);
     }
 
-    /// The moment the next inspection would be due: one interval after the
-    /// current inspection's due date (§8.5).
+    /// The cutoff: when the next inspection would be due (one interval after the
+    /// current due date), or the end-of-term cutoff — end date + RESUBMISSION_PERIOD —
+    /// if that comes sooner (§8.5, §8.8).
     function _cutoff() internal view returns (uint256) {
-        return _currentDue + inspectionInterval;
+        uint256 normal = _currentDue + inspectionInterval;
+        uint256 endOfTerm = endDate + RESUBMISSION_PERIOD;
+        return normal < endOfTerm ? normal : endOfTerm;
     }
 
     /// Once the owner's deadline has passed without a decision, anyone may trigger
@@ -817,14 +834,23 @@ contract OMPilot {
         uint256 submissionEntry = theClaim.pendingEntry;
         noteEntry = _addEntry(EntryKind.RejectionNote, owner, noteFingerprint, submissionEntry, 0);
         _updateCoverage();
+
         if (theClaim.attempts >= MAX_CLAIM_ATTEMPTS) {
             emit ClaimRejected(claimId, submissionEntry, noteEntry, 0);
             _lapseClaim(claimId, block.timestamp); // the third rejection ends the claim
             return noteEntry;
         }
+        // End-of-term cutoff (§8.8): it shortens a resubmission period that runs into it;
+        // a rejection after it gets a full period. (The spec's "final review after the
+        // cutoff" needs no code for claims: a first attempt can't still be under review
+        // at the cutoff, so the earliest rejection after it is of attempt 2 — its extra
+        // chance is attempt 3, which the 3-attempt limit already makes final.)
+        uint256 cutoff = endDate + RESUBMISSION_PERIOD;
+        uint256 resubmitBy = block.timestamp + RESUBMISSION_PERIOD;
+        if (block.timestamp < cutoff && resubmitBy > cutoff) resubmitBy = cutoff;
         theClaim.state = ClaimState.Rejected;
         theClaim.rejectedFingerprint = _entries[submissionEntry - 1].fingerprint;
-        theClaim.resubmitDeadline = block.timestamp + RESUBMISSION_PERIOD;
+        theClaim.resubmitDeadline = resubmitBy;
         theClaim.pendingEntry = 0;
         theClaim.reviewDeadline = 0;
         emit ClaimRejected(claimId, submissionEntry, noteEntry, theClaim.resubmitDeadline);
