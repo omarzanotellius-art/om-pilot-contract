@@ -18,8 +18,9 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///      settling, and recording misses by anyone. Part 4b: cutoffs — a dispute
 ///      can't run on into the next inspection. Part 5a: repair claims (submit,
 ///      confirm, pay), budget periods, the full lock (decision 59), available budget.
-///      Still to come in Stage 2: claim rejection, resubmission, attempts, timeout
-///      and lapses (5b), and end of term (6).
+///      Part 5b: claim rejection with a note, resubmission with new evidence only,
+///      the 3-attempt limit, timeout payment by anyone, and lapses.
+///      Still to come in Stage 2: end of term (6).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -116,7 +117,10 @@ contract OMPilot {
     enum ClaimState {
         None, // no such claim
         PendingReview, // awaiting the owner's decision
-        Confirmed // confirmed and paid
+        Confirmed, // confirmed and paid
+        Rejected, // rejected with a note; the provider may resubmit within the period
+        PaidOnTimeout, // the owner didn't decide in time; payment was triggered after the deadline
+        Lapsed // ended unpaid (third rejection, or no resubmission in time); budget freed
     }
 
     /// What is kept about each repair claim. Lines and amount are fixed at the
@@ -129,6 +133,8 @@ contract OMPilot {
         uint256 pendingEntry; // passport entry under review
         uint256 submittedAt;
         uint256 reviewDeadline; // decisions only strictly before this
+        uint256 resubmitDeadline; // after a rejection: resubmission only strictly before this
+        bytes32 rejectedFingerprint; // evidence of the attempt just rejected
     }
 
     /// The kinds of entry in the passport (the numbered logbook).
@@ -198,6 +204,13 @@ contract OMPilot {
     /// Repair claim `claimId` was paid; `triggeredBy` sent the transaction that settled it.
     event ClaimPaid(uint256 indexed claimId, uint256 amount, ClaimState outcome, address indexed triggeredBy);
 
+    /// The owner rejected claim `claimId`'s submission in `submissionEntry`, with her note in
+    /// `noteEntry`. `resubmitBy` is 0 when this was the last attempt (the claim lapses).
+    event ClaimRejected(uint256 indexed claimId, uint256 submissionEntry, uint256 noteEntry, uint256 resubmitBy);
+
+    /// Claim `claimId` lapsed at `lapsedAt`, unpaid; its budget is freed.
+    event ClaimLapsed(uint256 indexed claimId, uint256 lapsedAt, address indexed recordedBy);
+
     /// The owner rejected the submission in `submissionEntry`, with her note in `noteEntry`.
     /// The provider may resubmit strictly before `resubmitBy`.
     event InspectionRejected(
@@ -245,6 +258,7 @@ contract OMPilot {
     error ClaimExceedsAvailableBudget(uint256 amount, uint256 available);
     error NoSuchClaim(uint256 claimId);
     error ClaimNotPendingReview(uint256 claimId);
+    error ClaimNotAwaitingResubmission(uint256 claimId);
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -319,6 +333,9 @@ contract OMPilot {
 
     /// Lines per repair claim (a rule of procedure, §7; decision 69).
     uint256 public constant MAX_CLAIM_LINES = 20;
+
+    /// Attempts per repair claim: the first + 2 resubmissions (§7; decision 64).
+    uint256 public constant MAX_CLAIM_ATTEMPTS = 3;
 
     uint256 public claimCount; // claims are numbered from 1
     mapping(uint256 => Claim) private _claims;
@@ -768,7 +785,9 @@ contract OMPilot {
             attempts: 1,
             pendingEntry: entryNumber,
             submittedAt: block.timestamp,
-            reviewDeadline: block.timestamp + REVIEW_WINDOW
+            reviewDeadline: block.timestamp + REVIEW_WINDOW,
+            resubmitDeadline: 0,
+            rejectedFingerprint: bytes32(0)
         });
         for (uint256 i = 0; i < lines.length; ++i) {
             _claimLines[claimId].push(lines[i]);
@@ -785,6 +804,71 @@ contract OMPilot {
         if (theClaim.state != ClaimState.PendingReview) revert ClaimNotPendingReview(claimId);
         if (block.timestamp >= theClaim.reviewDeadline) revert ReviewDeadlinePassed();
         _payClaim(claimId, ClaimState.Confirmed);
+    }
+
+    /// The owner rejects a claim under review, strictly before its deadline, with the
+    /// fingerprint of a rejection note. If this was the third attempt, the claim lapses.
+    function rejectClaim(uint256 claimId, bytes32 noteFingerprint) external returns (uint256 noteEntry) {
+        if (msg.sender != owner) revert NotOwner();
+        Claim storage theClaim = _existingClaim(claimId);
+        if (theClaim.state != ClaimState.PendingReview) revert ClaimNotPendingReview(claimId);
+        if (block.timestamp >= theClaim.reviewDeadline) revert ReviewDeadlinePassed();
+
+        uint256 submissionEntry = theClaim.pendingEntry;
+        noteEntry = _addEntry(EntryKind.RejectionNote, owner, noteFingerprint, submissionEntry, 0);
+        _updateCoverage();
+        if (theClaim.attempts >= MAX_CLAIM_ATTEMPTS) {
+            emit ClaimRejected(claimId, submissionEntry, noteEntry, 0);
+            _lapseClaim(claimId, block.timestamp); // the third rejection ends the claim
+            return noteEntry;
+        }
+        theClaim.state = ClaimState.Rejected;
+        theClaim.rejectedFingerprint = _entries[submissionEntry - 1].fingerprint;
+        theClaim.resubmitDeadline = block.timestamp + RESUBMISSION_PERIOD;
+        theClaim.pendingEntry = 0;
+        theClaim.reviewDeadline = 0;
+        emit ClaimRejected(claimId, submissionEntry, noteEntry, theClaim.resubmitDeadline);
+    }
+
+    /// The provider resubmits a rejected claim with NEW evidence; the lines and the
+    /// amount stay as first claimed (decision 79). Within the resubmission period only.
+    function resubmitClaim(uint256 claimId, bytes32 fingerprint) external returns (uint256 entryNumber) {
+        if (msg.sender != provider) revert NotProvider();
+        Claim storage theClaim = _existingClaim(claimId);
+        if (theClaim.state != ClaimState.Rejected) revert ClaimNotAwaitingResubmission(claimId);
+        if (block.timestamp >= theClaim.resubmitDeadline) revert ResubmissionPeriodOver();
+        if (fingerprint == theClaim.rejectedFingerprint) revert SameEvidenceAsRejected();
+
+        entryNumber = _addEntry(EntryKind.ClaimSubmission, provider, fingerprint, claimId, 0);
+        theClaim.state = ClaimState.PendingReview;
+        theClaim.attempts += 1;
+        theClaim.pendingEntry = entryNumber;
+        theClaim.submittedAt = block.timestamp;
+        theClaim.reviewDeadline = block.timestamp + REVIEW_WINDOW;
+        theClaim.resubmitDeadline = 0;
+        theClaim.rejectedFingerprint = bytes32(0);
+        _updateCoverage();
+        emit ClaimSubmitted(claimId, entryNumber, theClaim.amount, theClaim.period);
+    }
+
+    /// Once the owner's deadline on a claim has passed without a decision, anyone may
+    /// trigger payment (decision 63); it always pays the provider.
+    function claimClaimOnTimeout(uint256 claimId) external {
+        Claim storage theClaim = _existingClaim(claimId);
+        if (theClaim.state != ClaimState.PendingReview) revert ClaimNotPendingReview(claimId);
+        if (block.timestamp < theClaim.reviewDeadline) revert ReviewStillOpen();
+        _payClaim(claimId, ClaimState.PaidOnTimeout);
+    }
+
+    /// Anyone may record that a rejected claim lapsed because its resubmission period
+    /// ran out (decision 80). This frees its budget.
+    function markClaimLapsed(uint256 claimId) external {
+        Claim storage theClaim = _existingClaim(claimId);
+        if (theClaim.state != ClaimState.Rejected || block.timestamp < theClaim.resubmitDeadline) {
+            revert NothingToRecord();
+        }
+        _lapseClaim(claimId, theClaim.resubmitDeadline);
+        _updateCoverage();
     }
 
     /// Everything kept about claim `claimId`.
@@ -808,11 +892,24 @@ contract OMPilot {
         return _claims[claimId];
     }
 
+    /// Ends a claim unpaid and frees its reservation from its own period's budget.
+    function _lapseClaim(uint256 claimId, uint256 lapsedAt) internal {
+        Claim storage theClaim = _claims[claimId];
+        theClaim.state = ClaimState.Lapsed;
+        _pendingInPeriod[theClaim.period] -= theClaim.amount;
+        _totalPending -= theClaim.amount;
+        theClaim.pendingEntry = 0;
+        theClaim.reviewDeadline = 0;
+        theClaim.resubmitDeadline = 0;
+        theClaim.rejectedFingerprint = bytes32(0);
+        emit ClaimLapsed(claimId, lapsedAt, msg.sender);
+    }
+
     /// Records the claim as paid in its own period, then pays (records first, money last).
     function _payClaim(uint256 claimId, ClaimState outcome) internal {
         Claim storage theClaim = _claims[claimId];
         uint256 amount = theClaim.amount;
-        theClaim.state = outcome;
+        theClaim.state = outcome; // pendingEntry is kept: it shows which submission was paid
         _pendingInPeriod[theClaim.period] -= amount;
         _totalPending -= amount;
         _paidInPeriod[theClaim.period] += amount;
