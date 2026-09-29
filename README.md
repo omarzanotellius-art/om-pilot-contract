@@ -4,13 +4,14 @@ A learning project: one Solidity smart contract that keeps a hash-anchored audit
 
 It is a learning exercise, built in the open to show asset owners and operators how a smart contract can work in day-to-day operations. It is **not** a security token, and it has nothing to do with tokenising or selling an asset.
 
-> **Status:** work in progress — Stage 1 (core contract) complete: tender terms, provider acceptance, deposits, withdrawals and the reserved-funds lock, with tests. Next: Stage 2 (inspections, repairs and payments). Nothing is deployed.
+> **Status:** work in progress — Stages 1–2 complete: the full contract (tender terms, acceptance, funding and the reserved-funds lock, the passport logbook, inspections with review, payment, misses and cutoffs, repair claims within a budget, and end of term), with 155 tests. Next: Stage 3 (a demo on the Polygon Amoy test network). Nothing is deployed.
 
 ## Read this first
 
 - **Not audited.** No security review of any kind. Do not use this code with real money.
 - **Testnet only.** Runs on a local simulated chain and on the Polygon Amoy test network, with valueless test tokens.
 - **Not a product or service.** It is not offered to anyone.
+- **Fund through `deposit`.** Money sent directly to the contract's address counts only from the contract's next action, which can affect whether a missed inspection is recorded as the owner's responsibility.
 - **Fictional names.** Jupiter Ridge Solar, Aldermont Energy Holdings, Tavistone Asset Services, and the people in the examples are invented. Any resemblance to real companies or people is unintended.
 
 ## Setup
