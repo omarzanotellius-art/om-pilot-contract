@@ -16,9 +16,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///      resubmission, and timeout payment triggered by anyone. Part 4a: misses
 ///      (window closed; resubmission period over), "missed (unfunded)", automatic
 ///      settling, and recording misses by anyone. Part 4b: cutoffs — a dispute
-///      can't run on into the next inspection.
-///      Still to come in Stage 2: repair claims, and end of term (which completes
-///      the lock and adds the end-of-term cutoff).
+///      can't run on into the next inspection. Part 5a: repair claims (submit,
+///      confirm, pay), budget periods, the full lock (decision 59), available budget.
+///      Still to come in Stage 2: claim rejection, resubmission, attempts, timeout
+///      and lapses (5b), and end of term (6).
 contract OMPilot {
     using SafeERC20 for IERC20; // token transfers that always stop the action if they fail
 
@@ -105,6 +106,31 @@ contract OMPilot {
         address recordedBy; // who sent the transaction that recorded the miss
     }
 
+    /// One line of a repair claim: an item on the price list and a quantity.
+    struct ClaimLine {
+        uint256 item; // position on the price list (0 = first)
+        uint256 quantity; // at least 1
+    }
+
+    /// Where a repair claim stands.
+    enum ClaimState {
+        None, // no such claim
+        PendingReview, // awaiting the owner's decision
+        Confirmed // confirmed and paid
+    }
+
+    /// What is kept about each repair claim. Lines and amount are fixed at the
+    /// first submission (decision 79).
+    struct Claim {
+        ClaimState state;
+        uint256 amount; // computed from the price list
+        uint256 period; // the budget period it belongs to (that of its first submission)
+        uint256 attempts; // submissions so far (at most 3 — decision 64)
+        uint256 pendingEntry; // passport entry under review
+        uint256 submittedAt;
+        uint256 reviewDeadline; // decisions only strictly before this
+    }
+
     /// The kinds of entry in the passport (the numbered logbook).
     /// Only Acceptance and UnpaidRecord are written so far; the others follow in Stage 2.
     enum EntryKind {
@@ -166,6 +192,12 @@ contract OMPilot {
         uint256 indexed inspection, MissReason reason, uint256 missedAt, address indexed recordedBy
     );
 
+    /// The provider submitted repair claim `claimId` for `amount`, in budget period `period`.
+    event ClaimSubmitted(uint256 indexed claimId, uint256 entryNumber, uint256 amount, uint256 period);
+
+    /// Repair claim `claimId` was paid; `triggeredBy` sent the transaction that settled it.
+    event ClaimPaid(uint256 indexed claimId, uint256 amount, ClaimState outcome, address indexed triggeredBy);
+
     /// The owner rejected the submission in `submissionEntry`, with her note in `noteEntry`.
     /// The provider may resubmit strictly before `resubmitBy`.
     event InspectionRejected(
@@ -207,6 +239,12 @@ contract OMPilot {
     error SameEvidenceAsRejected();
     error ReviewStillOpen();
     error NothingToRecord();
+    error ClaimsNotAllowed();
+    error InvalidClaimLines();
+    error InvalidClaimLine(uint256 index);
+    error ClaimExceedsAvailableBudget(uint256 amount, uint256 available);
+    error NoSuchClaim(uint256 claimId);
+    error ClaimNotPendingReview(uint256 claimId);
 
     // ------------------------------------------------------------------
     // Terms — written once at creation; no function can change them
@@ -274,6 +312,21 @@ contract OMPilot {
 
     /// Whether the one extra resubmission chance after the cutoff has been given.
     bool private _postCutoffChanceUsed;
+
+    // ------------------------------------------------------------------
+    // Repair claims and budget periods
+    // ------------------------------------------------------------------
+
+    /// Lines per repair claim (a rule of procedure, §7; decision 69).
+    uint256 public constant MAX_CLAIM_LINES = 20;
+
+    uint256 public claimCount; // claims are numbered from 1
+    mapping(uint256 => Claim) private _claims;
+    mapping(uint256 => ClaimLine[]) private _claimLines;
+
+    mapping(uint256 => uint256) private _paidInPeriod; // per budget period
+    mapping(uint256 => uint256) private _pendingInPeriod; // claims awaiting a decision, per period
+    uint256 private _totalPending; // across all periods
 
     mapping(uint256 => InspectionRecord) private _inspectionRecords;
 
@@ -386,17 +439,26 @@ contract OMPilot {
     }
 
     // ------------------------------------------------------------------
-    // The rolling lock (Stage 1 version)
+    // The rolling lock (decisions 53, 59)
     // ------------------------------------------------------------------
 
     /// Money reserved for the provider, which the owner cannot withdraw.
     /// Zero until the provider accepts (decision 53) — so also zero if the
-    /// contract never activated. Once accepted: the next inspection's fee plus
-    /// the repair budget. (Stage 2 makes this shrink with payments and reset
-    /// each budget period.)
+    /// contract never activated. Once accepted (decision 59): the fee of the next
+    /// unresolved inspection (if one is still scheduled in the term) + this budget
+    /// period's budget minus what has been paid this period + claims still pending
+    /// from earlier periods. Pending claims of this period sit inside the budget term.
+    /// (After the end date the lock is released step by step: part 6.)
     function lockedAmount() public view returns (uint256) {
         if (!accepted) return 0;
-        return inspectionRate + repairBudget;
+        uint256 period = currentPeriod();
+        uint256 earlierPending = _totalPending - _pendingInPeriod[period];
+        return _scheduledFee() + (repairBudget - _paidInPeriod[period]) + earlierPending;
+    }
+
+    /// The inspection fee, if an inspection is still scheduled within the term.
+    function _scheduledFee() internal view returns (uint256) {
+        return _currentDue <= endDate ? inspectionRate : 0;
     }
 
     /// What the owner can withdraw right now: balance minus lock, never below zero.
@@ -653,6 +715,111 @@ contract OMPilot {
         if (block.timestamp < _currentDue) return InspectionPhase.NotYetDue;
         if (block.timestamp < _currentDue + tolerance) return InspectionPhase.WindowOpen;
         return InspectionPhase.WindowClosed;
+    }
+
+    // ------------------------------------------------------------------
+    // Repair claims (part 5a)
+    // ------------------------------------------------------------------
+
+    /// The budget period now: 0 until one interval after the start, then 1, ...
+    /// (a fixed grid from the start date — §8.6).
+    function currentPeriod() public view returns (uint256) {
+        if (block.timestamp < startDate) return 0;
+        return (block.timestamp - startDate) / inspectionInterval;
+    }
+
+    /// What a new claim may cost right now: this period's budget minus paid and
+    /// pending, limited to what the balance still covers after the inspection fee
+    /// and all pending claims (the inspection comes first — §8.2). Zero unless Active.
+    function availableRepairBudget() public view returns (uint256) {
+        if (!accepted || block.timestamp < startDate || block.timestamp >= endDate) return 0;
+        uint256 period = currentPeriod();
+        uint256 byBudget = repairBudget - _paidInPeriod[period] - _pendingInPeriod[period];
+        uint256 reserved = _scheduledFee() + _totalPending;
+        uint256 bal = balance();
+        uint256 byBalance = bal > reserved ? bal - reserved : 0;
+        return byBudget < byBalance ? byBudget : byBalance;
+    }
+
+    /// The provider claims for a routine repair already done: 1–20 lines from the
+    /// price list, plus the fingerprint of the repair evidence. The contract computes
+    /// the amount. Only while Active (decision 66), and only within the available budget.
+    function submitClaim(ClaimLine[] calldata lines, bytes32 fingerprint) external returns (uint256 claimId) {
+        if (msg.sender != provider) revert NotProvider();
+        if (!accepted || block.timestamp < startDate || block.timestamp >= endDate) revert ClaimsNotAllowed();
+        if (lines.length == 0 || lines.length > MAX_CLAIM_LINES) revert InvalidClaimLines();
+
+        uint256 amount;
+        for (uint256 i = 0; i < lines.length; ++i) {
+            if (lines[i].item >= _priceList.length || lines[i].quantity == 0) revert InvalidClaimLine(i);
+            amount += _priceList[lines[i].item].price * lines[i].quantity;
+        }
+        _updateCoverage();
+        uint256 available = availableRepairBudget();
+        if (amount > available) revert ClaimExceedsAvailableBudget(amount, available);
+
+        claimId = ++claimCount;
+        uint256 period = currentPeriod();
+        uint256 entryNumber = _addEntry(EntryKind.ClaimSubmission, provider, fingerprint, claimId, 0);
+        _claims[claimId] = Claim({
+            state: ClaimState.PendingReview,
+            amount: amount,
+            period: period,
+            attempts: 1,
+            pendingEntry: entryNumber,
+            submittedAt: block.timestamp,
+            reviewDeadline: block.timestamp + REVIEW_WINDOW
+        });
+        for (uint256 i = 0; i < lines.length; ++i) {
+            _claimLines[claimId].push(lines[i]);
+        }
+        _pendingInPeriod[period] += amount;
+        _totalPending += amount;
+        emit ClaimSubmitted(claimId, entryNumber, amount, period);
+    }
+
+    /// The owner confirms a claim under review, strictly before its deadline; it is paid.
+    function confirmClaim(uint256 claimId) external {
+        if (msg.sender != owner) revert NotOwner();
+        Claim storage theClaim = _existingClaim(claimId);
+        if (theClaim.state != ClaimState.PendingReview) revert ClaimNotPendingReview(claimId);
+        if (block.timestamp >= theClaim.reviewDeadline) revert ReviewDeadlinePassed();
+        _payClaim(claimId, ClaimState.Confirmed);
+    }
+
+    /// Everything kept about claim `claimId`.
+    function claim(uint256 claimId) external view returns (Claim memory) {
+        return _existingClaim(claimId);
+    }
+
+    /// The lines of claim `claimId`.
+    function claimLines(uint256 claimId) external view returns (ClaimLine[] memory) {
+        _existingClaim(claimId);
+        return _claimLines[claimId];
+    }
+
+    /// Paid and pending amounts for budget period `period`.
+    function periodBudget(uint256 period) external view returns (uint256 paid, uint256 pending) {
+        return (_paidInPeriod[period], _pendingInPeriod[period]);
+    }
+
+    function _existingClaim(uint256 claimId) internal view returns (Claim storage) {
+        if (claimId == 0 || claimId > claimCount) revert NoSuchClaim(claimId);
+        return _claims[claimId];
+    }
+
+    /// Records the claim as paid in its own period, then pays (records first, money last).
+    function _payClaim(uint256 claimId, ClaimState outcome) internal {
+        Claim storage theClaim = _claims[claimId];
+        uint256 amount = theClaim.amount;
+        theClaim.state = outcome;
+        _pendingInPeriod[theClaim.period] -= amount;
+        _totalPending -= amount;
+        _paidInPeriod[theClaim.period] += amount;
+
+        token.safeTransfer(provider, amount);
+        _updateCoverage();
+        emit ClaimPaid(claimId, amount, outcome, msg.sender);
     }
 
     // ------------------------------------------------------------------
