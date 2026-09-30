@@ -1,0 +1,6 @@
+FICTIONAL DEMO EVIDENCE — Jupiter Ridge Solar is an invented asset; all names are fictional.
+TENDER AWARD (summary)
+Owner: Aldermont Energy Holdings (Dana). Provider: Tavistone Asset Services (Luis).
+Asset: Jupiter Ridge Solar. Demo terms: inspection every 30 minutes (10-minute tolerance),
+80-minute term, 5 USDC per inspection, 5 USDC repair budget per period.
+Price list: string fuse 1, connector 1, inverter reset visit 2, combiner breaker 3 (USDC).
