@@ -39,6 +39,4 @@ None of these affect the contract itself: nothing from these packages is deploye
 
 ## License
 
-Copyright © 2026 OnToken, LLC. All rights reserved.
-
-An open-source license is to be decided before this repository is made public. Until a license file is added, no permission to use, copy or modify this code is granted.
+Copyright © 2026 OnToken, LLC. Free to use under the [MIT License](LICENSE): anyone may use, copy and adapt it, at their own risk and with no warranty.
