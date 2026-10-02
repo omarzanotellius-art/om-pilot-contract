@@ -2,7 +2,7 @@
 
 A learning project: one Solidity smart contract that keeps a hash-anchored audit trail of operations-and-maintenance (O&M) records for a single solar asset, and releases stablecoin payments for inspections and routine repairs under fixed, written rules.
 
-It is a learning exercise, built in the open to show asset owners and operators how a smart contract can work in day-to-day operations. It is **not** a security token, and it has nothing to do with tokenising or selling an asset.
+It is a learning exercise, built in the open to show asset owners and operators how a smart contract can work in day-to-day operations. It is **not** a security token, and it has nothing to do with tokenizing or selling an asset.
 
 > **Status:** work in progress — Stages 1–2 complete: the full contract (tender terms, acceptance, funding and the reserved-funds lock, the passport logbook, inspections with review, payment, misses and cutoffs, repair claims within a budget, and end of term), with 155 tests. Next: Stage 3 (a demo on the Polygon Amoy test network). Nothing is deployed.
 
