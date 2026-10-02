@@ -17,7 +17,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { network } from "hardhat";
-import { formatEther, formatUnits } from "viem";
+import { formatEther, formatUnits, parseGwei } from "viem";
 
 // ---- demo terms (decision 86) --------------------------------------------
 const MIN = 60n;
@@ -37,6 +37,12 @@ const PRICE_LIST = [
 ];
 const CIRCLE_TEST_USDC_AMOY = "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582"; // spec §12
 const EXPLORER = "https://amoy.polygonscan.com";
+
+// Fees: Polygon networks refuse any transaction whose tip (priority fee) is below
+// 25 gwei; wallet estimates can be far lower (MetaMask offered 1.5). Every transaction
+// here offers a fixed 30-gwei tip — not the network's suggestion, which on Amoy has
+// reached 600 gwei and would multiply the demo's cost — plus room for the base fee.
+const TIP = parseGwei("30");
 
 // Enum positions, as declared in the contract
 const Finding = { NoIssuesFound: 0, IssuesFound: 1 } as const;
@@ -65,11 +71,17 @@ console.log(`Owner (Dana):    ${owner.account.address}`);
 console.log(`Provider (Luis): ${provider.account.address}\n`);
 
 // ---- progress state (resumable on any persistent chain) -----------------------
+/** Fee settings for the next transaction, recomputed each time (the base fee moves). */
+async function fees() {
+  const base = (await publicClient.getBlock()).baseFeePerGas ?? 0n;
+  return { maxPriorityFeePerGas: TIP, maxFeePerGas: base * 2n + TIP };
+}
+
 type State = {
   contract?: `0x${string}`;
   token?: `0x${string}`;
   claimId?: string;
-  done: Record<string, { tx?: string; at: string }>;
+  done: Record<string, { tx?: string; at: string; from?: string; gas?: string }>;
   pending?: { step: string; tx: `0x${string}` };
 };
 const state: State = persist && existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, "utf8")) : { done: {} };
@@ -104,7 +116,7 @@ async function step(name: string, send: () => Promise<`0x${string}`>) {
   }
   const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
   if (receipt.status !== "success") throw new Error(`${name}: transaction failed (${link(tx)})`);
-  state.done[name] = { tx, at: new Date().toISOString() };
+  state.done[name] = { tx, at: new Date().toISOString(), from: receipt.from, gas: receipt.gasUsed.toString() };
   delete state.pending;
   save();
   console.log(`✓ ${name}   ${link(tx)}`);
@@ -143,13 +155,15 @@ const usdc = await viem.getContractAt("MockUSDC", state.token); // same ERC-20 i
 
 // ---- pre-flight (live networks): stop before spending anything if funds are short
 if (!localChain && !state.done["deploy"]) {
-  const gasPrice = await publicClient.getGasPrice();
-  const needOwner = (4_300_000n * gasPrice * 12n) / 10n; // measured gas + 20% margin
-  const needProvider = (1_300_000n * gasPrice * 12n) / 10n;
+  const gasPrice = (await fees()).maxFeePerGas; // worst case per unit of gas
+  // Gas measured over the whole storyline in the local rehearsal (Owner 4,336,278;
+  // Provider 1,697,759), rounded up, plus a 20% margin.
+  const needOwner = (4_400_000n * gasPrice * 12n) / 10n;
+  const needProvider = (1_750_000n * gasPrice * 12n) / 10n;
   const polOwner = await publicClient.getBalance({ address: owner.account.address });
   const polProvider = await publicClient.getBalance({ address: provider.account.address });
   const usdcOwner = await usdc.read.balanceOf([owner.account.address]);
-  console.log(`Gas price: ${formatUnits(gasPrice, 9)} gwei`);
+  console.log(`Max fee per gas: ${formatUnits(gasPrice, 9)} gwei (tip ${formatUnits(TIP, 9)})`);
   console.log(`Owner POL ${formatEther(polOwner)} (needs ~${formatEther(needOwner)}), USDC ${formatUnits(usdcOwner, 6)} (needs 20)`);
   console.log(`Provider POL ${formatEther(polProvider)} (needs ~${formatEther(needProvider)})\n`);
   const short: string[] = [];
@@ -175,7 +189,7 @@ await step("deploy", async () => {
     inspectionRate: RATE,
     repairBudget: BUDGET,
   };
-  const { deploymentTransaction } = await viem.sendDeploymentTransaction("OMPilot", [terms, PRICE_LIST]);
+  const { deploymentTransaction } = await viem.sendDeploymentTransaction("OMPilot", [terms, PRICE_LIST], await fees());
   return deploymentTransaction.hash;
 });
 if (!state.contract) {
@@ -185,51 +199,54 @@ if (!state.contract) {
 }
 const c = await viem.getContractAt("OMPilot", state.contract);
 console.log(`  contract: ${onAmoy ? `${EXPLORER}/address/${state.contract}` : state.contract}`);
-const asOwner = { account: owner.account };
-const asProvider = { account: provider.account };
+const asOwner = async () => ({ account: owner.account, ...(await fees()) });
+const asProvider = async () => ({ account: provider.account, ...(await fees()) });
 
 // ---- 2. Signing and funding --------------------------------------------------------
-await step("accept", () => c.write.accept(asProvider));
-await step("log handover visit", () => c.write.logRecord([RecordType.SiteVisit, fingerprint("handover-visit")], asProvider));
-await step("approve 20 USDC", () => usdc.write.approve([state.contract!, DEPOSIT], asOwner));
-await step("deposit 20 USDC", () => c.write.deposit([DEPOSIT], asOwner));
+await step("accept", async () => c.write.accept(await asProvider()));
+await step("log handover visit", async () => c.write.logRecord([RecordType.SiteVisit, fingerprint("handover-visit")], await asProvider()));
+await step("approve 20 USDC", async () => usdc.write.approve([state.contract!, DEPOSIT], await asOwner()));
+await step("deposit 20 USDC", async () => c.write.deposit([DEPOSIT], await asOwner()));
 
 // ---- 3. Inspection #1: issues found, rejected, repaired, resubmitted, confirmed ----
 const [, due1] = await c.read.currentInspectionInfo();
 if (!state.done["confirm inspection #1"]) await waitUntil("inspection #1 falls due", due1);
-await step("submit inspection #1 (issues found)", () =>
-  c.write.submitInspection([fingerprint("inspection-1-attempt-1"), Finding.IssuesFound], asProvider));
-await step("reject inspection #1 with a note", () => c.write.rejectInspection([fingerprint("rejection-note-1")], asOwner));
-await step("claim repair: 2 x connector", () =>
-  c.write.submitClaim([[{ item: 1n, quantity: 2n }], fingerprint("repair-1")], asProvider));
+await step("submit inspection #1 (issues found)", async () =>
+  c.write.submitInspection([fingerprint("inspection-1-attempt-1"), Finding.IssuesFound], await asProvider()));
+await step("reject inspection #1 with a note", async () => c.write.rejectInspection([fingerprint("rejection-note-1")], await asOwner()));
+await step("claim repair: 2 x connector", async () =>
+  c.write.submitClaim([[{ item: 1n, quantity: 2n }], fingerprint("repair-1")], await asProvider()));
 if (!state.claimId) {
   state.claimId = (await c.read.claimCount()).toString();
   save();
 }
-await step("resubmit inspection #1 (no issues found)", () =>
-  c.write.submitInspection([fingerprint("inspection-1-attempt-2"), Finding.NoIssuesFound], asProvider));
-await step("confirm inspection #1", () => c.write.confirmInspection(asOwner));
-await step("confirm repair claim", () => c.write.confirmClaim([BigInt(state.claimId!)], asOwner));
+await step("resubmit inspection #1 (no issues found)", async () =>
+  c.write.submitInspection([fingerprint("inspection-1-attempt-2"), Finding.NoIssuesFound], await asProvider()));
+await step("confirm inspection #1", async () => c.write.confirmInspection(await asOwner()));
+await step("confirm repair claim", async () => c.write.confirmClaim([BigInt(state.claimId!)], await asOwner()));
 
 // ---- 4. Inspection #2 ----------------------------------------------------------------
 if (!state.done["confirm inspection #2"]) {
   const [, due2] = await c.read.currentInspectionInfo();
   await waitUntil("inspection #2 falls due", due2);
 }
-await step("submit inspection #2 (no issues found)", () =>
-  c.write.submitInspection([fingerprint("inspection-2"), Finding.NoIssuesFound], asProvider));
-await step("confirm inspection #2", () => c.write.confirmInspection(asOwner));
+await step("submit inspection #2 (no issues found)", async () =>
+  c.write.submitInspection([fingerprint("inspection-2"), Finding.NoIssuesFound], await asProvider()));
+await step("confirm inspection #2", async () => c.write.confirmInspection(await asOwner()));
 
 // ---- 5. End of term: Closed, withdraw the rest ------------------------------------------
 if (!state.done["withdraw the rest"]) await waitUntil("end date", await c.read.endDate());
 const status = Status[Number(await c.read.status())];
 console.log(`  status: ${status}`);
 if (!state.done["withdraw the rest"] && status !== "Closed") throw new Error(`Expected Closed, found ${status}.`);
-await step("withdraw the rest", async () => c.write.withdraw([await c.read.availableToWithdraw()], asOwner));
+await step("withdraw the rest", async () => c.write.withdraw([await c.read.availableToWithdraw()], await asOwner()));
 
 // ---- Summary -----------------------------------------------------------------------------
 console.log(`\nProvider received: ${formatUnits(await usdc.read.balanceOf([provider.account.address]), 6)} USDC (expected 12)`);
 console.log(`Contract balance:  ${formatUnits(await c.read.balance(), 6)} USDC (expected 0)`);
 console.log(`Passport entries:  ${await c.read.entryCount()} (expected 7)`);
+const gasBy = (who: string) =>
+  Object.values(state.done).filter((d) => d.from?.toLowerCase() === who.toLowerCase()).reduce((t, d) => t + BigInt(d.gas ?? 0), 0n);
+console.log(`Gas used:          Owner ${gasBy(owner.account.address)}, Provider ${gasBy(provider.account.address)}`);
 if (persist) console.log(`Progress file:     ${STATE_FILE}`);
 console.log("Demo complete.\n");
