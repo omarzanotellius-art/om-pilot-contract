@@ -1,0 +1,91 @@
+{
+  "done": {
+    "deploy": {
+      "tx": "0x953cdbd8250036c6bd6c8ac584eacf353bfe66dbba5ae91e9cf8c26641a39828",
+      "at": "2026-10-02T15:32:04.180Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "3573557"
+    },
+    "accept": {
+      "tx": "0xa2d1db6cf00f7c20143a8429d1c05108d92512d6a757813d12fdb45d8d8b9693",
+      "at": "2026-10-02T15:32:08.427Z",
+      "from": "0x8a29dbca059746c4694eb91f83cb2687397c69fc",
+      "gas": "254597"
+    },
+    "log handover visit": {
+      "tx": "0x08bfa6f652a2b0dcc924c8804cbf66887d524269ba36c0c19fedeb4b0587de9e",
+      "at": "2026-10-02T15:32:12.610Z",
+      "from": "0x8a29dbca059746c4694eb91f83cb2687397c69fc",
+      "gas": "212755"
+    },
+    "approve 20 USDC": {
+      "tx": "0x4a377498b5841ef88e0e925b9d03450197a1d2dd80d5f01232095955588c2bb0",
+      "at": "2026-10-02T15:32:16.720Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "66357"
+    },
+    "deposit 20 USDC": {
+      "tx": "0x152fdef0ebf2bd2bf557a1d9da6309165e059f5707ba7b53ebff4e507568e5f9",
+      "at": "2026-10-02T15:32:20.829Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "117612"
+    },
+    "submit inspection #1 (issues found)": {
+      "tx": "0x0b47978e69c04b5bfd212a92e8542cedf9bb799703459236c55e5761911e76cb",
+      "at": "2026-10-02T16:12:03.592Z",
+      "from": "0x8a29dbca059746c4694eb91f83cb2687397c69fc",
+      "gas": "345968"
+    },
+    "reject inspection #1 with a note": {
+      "tx": "0x1bcfd5dbf8541a3539403dbf4da86d910d59d4b129a8575da6b6615ccdd04d5e",
+      "at": "2026-10-02T16:12:07.725Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "290186"
+    },
+    "claim repair: 2 x connector": {
+      "tx": "0xe45976295345be0e7c79aeca9d8f56df8d42bf6521116b09ba54aa1cd26915fc",
+      "at": "2026-10-02T16:12:11.840Z",
+      "from": "0x8a29dbca059746c4694eb91f83cb2687397c69fc",
+      "gas": "561548"
+    },
+    "resubmit inspection #1 (no issues found)": {
+      "tx": "0xa7202c35c565755a8f38c6b538cd38758dc802a6c035cf509b5f4fca48b49c42",
+      "at": "2026-10-02T16:12:15.980Z",
+      "from": "0x8a29dbca059746c4694eb91f83cb2687397c69fc",
+      "gas": "318277"
+    },
+    "confirm inspection #1": {
+      "tx": "0xe30440fb0c70d6422c958f595e86efa51a4cf68df09da06ad04dfe0f64964fd4",
+      "at": "2026-10-02T16:12:20.122Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "222663"
+    },
+    "confirm repair claim": {
+      "tx": "0xf226acad54428e4bd0d9be336e5d99ff5d7845af102492a278c0c386e515b7aa",
+      "at": "2026-10-02T16:12:24.254Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "135441"
+    },
+    "submit inspection #2 (no issues found)": {
+      "tx": "0x00d2f7ef3176ef184563ee534482d93abccd57f0a00d10f5d330c4afdae7f510",
+      "at": "2026-10-02T16:42:17.184Z",
+      "from": "0x8a29dbca059746c4694eb91f83cb2687397c69fc",
+      "gas": "326044"
+    },
+    "confirm inspection #2": {
+      "tx": "0x65930e895de21a7127bf276ca14799a9a5cf176b9f030126c655cc58f18c42e7",
+      "at": "2026-10-02T16:42:21.346Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "208723"
+    },
+    "withdraw the rest": {
+      "tx": "0x42620f13010297f70966b5e76e7e32157c60cd5e75575c61d80085a7cdae592b",
+      "at": "2026-10-02T17:02:03.494Z",
+      "from": "0x0930ce1faee50452e3cdd24a23dfd65ba87c1dd1",
+      "gas": "101596"
+    }
+  },
+  "token": "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582",
+  "contract": "0x641557b9392e67547dce6e6970ade4d9987defd7",
+  "claimId": "1"
+}
